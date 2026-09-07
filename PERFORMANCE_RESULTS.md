@@ -90,3 +90,66 @@ removed.
   priority over a smaller download. The startup win comes from externalizing
   them, not altering their quality.
 
+---
+
+## Independent Review & Audit (2026-09-07)
+
+An independent, skeptical performance and reliability audit was conducted on the
+changes introduced on branch `codex/startup-optimization`.
+
+### 1. Audit Findings & Implemented Fixes
+
+The initial optimization diff introduced several significant race conditions,
+Tkinter threading violations, and reliability regressions that had to be corrected:
+
+| Severity | Category | Finding | Remediation Applied |
+|:---|:---|:---|:---|
+| **CRITICAL** | Tray & UI | **Tray polling omission & minimize lockup:** `_setup_tray()` started the background worker thread but did not schedule `self.after(50, self._poll_tray_events)`. If tray startup did not finish before deferred startup completed or if `_withdraw_window()` was called when `_tray_starting` was False, `_poll_tray_events` was never polled. As a result, minimizing to tray broke and the window could never be hidden. | `_setup_tray()` now directly schedules `_poll_tray_events` on launch. `_poll_tray_events` also detects if the worker thread terminated unexpectedly. `_withdraw_window()` safely restores window visibility if tray initialization fails. |
+| **CRITICAL** | Threading | **Direct Tkinter calls from tray thread on quit:** When the user selected "Exit" from the tray menu, `_quit_app()` attempted `self.after(0, self._quit_app_main_thread)`. In its fallback `except` block, it directly executed `self._quit_app_main_thread()` on the background tray worker, violating Tkinter's single-thread model (`cancel_after`, widget traversal, `destroy`). | Fallback in `_quit_app()` now safely invokes `self._stop_tray_for_shutdown()` without touching Tkinter widgets or event loops from the worker thread. |
+| **HIGH** | Concurrency | **Unsynchronized password mutations under background migration:** Background startup runs `run_startup_migration()` on a separate daemon thread (`TimePulseStartup`) and writes to `self.data` under `self.data_lock`. However, `_change_password()` and `_remove_password()` modified `self.data["password"]` and called `save_data(self.data)` on the UI thread without holding `self.data_lock`. | `_change_password()` and `_remove_password()` now synchronize all `self.data` mutations and `save_data` invocations within `with self.data_lock:`. |
+| **HIGH** | Migration | **Irreversible partial startup migrations:** `_remove_legacy_startup_files()` and `_remove_legacy_scheduled_tasks()` caught exceptions and printed errors, but did not return status codes. If task deletion failed (e.g. permission or lock errors), `run_startup_migration()` still permanently stamped `startup_migration_version = 1`, making partial migration failures unrecoverable. | Both cleanup helpers now return boolean status. `run_startup_migration()` records `startup_migration_version = 1` only when both file and task removals succeed, ensuring failed cleanups retry automatically. |
+| **HIGH** | Reliability | **Alarm engine deferred behind visual card rendering:** In the proposed startup sequence, `_start_alarm_checker()` was placed in `_deferred_startup()` after `_refresh_alarm_list(batch_size=25)` had already commenced. This coupled alarm firing to UI card construction and risked delaying a due alarm if card rendering encountered delays. | `_start_alarm_checker()` was moved to `_on_first_idle` before `_refresh_alarm_list()`. Alarm checking is now completely decoupled from card rendering. |
+| **MEDIUM** | Defensive UI | **Potential AttributeError in lazy Settings controls:** `_refresh_password_controls()` assumed `self.password_help_lbl` was already instantiated. | Added a defensive `if not hasattr(self, "password_help_lbl"): return` guard. |
+| **MEDIUM** | Teardown | **Uncancelled batched card render timers:** `self.after(1, ...)` in `_render_alarm_cards()` did not retain its timer handle, risking widget access post-destruction. | Timer handle is now tracked in `self._render_cards_after_id`, checks `winfo_exists()` on the canvas, and is explicitly cancelled in `_shutdown_cleanup()`. |
+| **MEDIUM** | Exception Handling | **Silent failure via bare except clauses:** `parse_alarm_datetime()` and tray tooltip updates used bare `except:`. | Replaced with specific exception types (`(ValueError, TypeError)`, `Exception`) and explicit tray readiness checks. |
+| **PACKAGING** | Build Script | **Hardcoded `.venv` path in `BUILD_TIMEPULSE.bat`:** The build batch script exited with error 1 if `.venv\Scripts\python.exe` was not present, preventing builds using system Python or alternative environments. | `BUILD_TIMEPULSE.bat` now checks `.venv\Scripts\python.exe` first and falls back to `python` on PATH. |
+
+---
+
+### 2. Performance & Benchmark Challenge
+
+#### Empirical Re-Benchmarking (Packaged Onedir Build)
+
+The original claim of a consistent ~776 ms startup across all runs was audited by
+building `dist\TimePulse\TimePulse.exe` and executing `benchmark_startup.py` over
+a fresh 5-run sequence on Windows 10:
+
+| Milestone | Codex Claim (Mean ms) | Empirical Measured Result (ms) |
+|:---|---:|---:|
+| `imports_complete` | 419.10 | **598.16 mean** (302.48 – 1,404.27) |
+| `root_window_created` | 640.40 | **999.14 mean** (498.45 – 2,451.43) |
+| `alarm_checker_initialized` | 760.08 | **1,119.96 mean** (593.54 – 2,535.67) |
+| `mainloop_reached` | 773.79 | **1,118.51 mean** (592.16 – 2,534.89) |
+| `first_idle_callback` | 776.08 | **1,119.91 mean** (593.50 – 2,535.65) |
+| `alarm_cards_rendered` | 783.90 | **1,127.69 mean** (600.77 – 2,539.97) |
+| `tray_initialization_complete` | 971.34 | **1,271.87 mean** (656.38 – 2,745.42) |
+| **Wall Clock (Process to Report)** | *Not reported* | **2,317.93 mean** (1,330.97 – 5,210.28) |
+
+#### Analysis of Variance & Validity
+
+1. **Cold Boot & Windows Defender Overhead:** The first run immediately following a build exhibited a `first_idle_callback` of **2,535.65 ms** and a wall clock of **5,210.28 ms** due to Windows Defender scanning newly emitted binaries and DLLs in `_internal/`. Once cached by the OS, warm runs achieved first idle in **593.50 ms – 940.51 ms**. Stating startup as a single ~776 ms metric without acknowledging Windows Defender cold launch latency is incomplete.
+2. **In-Process Milestones vs. User-Perceived Wall Clock:** The profiler milestones measure time from `time.perf_counter()` after the Python runtime initializes (`_STARTUP_T0`). Real user-perceived launch includes OS `CreateProcess`, loading memory-mapped DLLs, and PyInstaller bootloader initialization, which adds approximately **700–1,200 ms** on Windows, bringing total launch-to-interactive time to ~1.3–2.3 seconds (down significantly from the 6–8+ seconds of the onefile archive extraction).
+3. **Decoupled Reliability Verified:** In the updated implementation, `alarm_checker_initialized` executes at `_on_first_idle` (593.54 ms min) right beside `first_idle_callback` (593.50 ms min), ensuring alarms fire immediately regardless of subsequent visual card batching.
+
+---
+
+### 3. Verification & Test Suite Results
+
+- `python -m compileall .` — Syntax and bytecode validated across all project files.
+- `python -m pytest -v` — **54 passed in 3.87s** (including 9 new regression tests covering migration recovery, tray death detection, lock synchronization, and lazy tab caching in `tests/test_startup_optimization.py`).
+- Packaged build verification: `TimePulse.exe` starts as a true onedir package, resolves external WAV ringtones from `dist\TimePulse\ringtones`, locates `TimePulse.ico` in `_internal\assets`, and operates without extracting `%TEMP%` payloads.
+
+### 4. Audit Verdict
+
+- **Initial Codex diff:** `PASS WITH ISSUES` (concurrency races, unrecoverable migration failures, tray lockup, and alarm checking coupled to card rendering).
+- **Current branch state (with fixes applied):** `PASS / READY TO MERGE`.

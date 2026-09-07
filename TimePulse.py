@@ -564,8 +564,9 @@ def _remove_legacy_startup_files():
     """Remove only exact Startup-folder filenames created by earlier app versions."""
     startup_dir = get_startup_folder()
     if not startup_dir:
-        return
+        return True
 
+    success = True
     for filename in LEGACY_STARTUP_FILE_NAMES:
         legacy_path = os.path.join(startup_dir, filename)
         try:
@@ -573,10 +574,13 @@ def _remove_legacy_startup_files():
                 os.remove(legacy_path)
         except Exception as exc:
             print(f"Failed to remove legacy startup entry '{filename}': {exc}")
+            success = False
+    return success
 
 
 def _remove_legacy_scheduled_tasks():
     """Best-effort cleanup of tasks created by earlier app versions."""
+    success = True
     for task_name in LEGACY_TASK_NAMES:
         try:
             result = subprocess.run(
@@ -589,8 +593,11 @@ def _remove_legacy_scheduled_tasks():
                 details = (result.stderr or result.stdout or "").strip()
                 if "cannot find" not in details.lower() and "not exist" not in details.lower():
                     print(f"Failed to remove legacy startup task '{task_name}': {details or result.returncode}")
+                    success = False
         except Exception as exc:
             print(f"Failed to remove legacy startup task '{task_name}': {exc}")
+            success = False
+    return success
 
 
 def enable_auto_start():
@@ -663,8 +670,11 @@ def run_startup_migration(data, data_lock):
     except (TypeError, ValueError):
         current_version = 0
 
-    _remove_legacy_startup_files()
-    _remove_legacy_scheduled_tasks()
+    files_ok = _remove_legacy_startup_files()
+    tasks_ok = _remove_legacy_scheduled_tasks()
+    if not (files_ok and tasks_ok):
+        print("Startup migration encountered errors; marker will not be saved so it can be retried.")
+        return False
 
     with data_lock:
         try:
@@ -800,7 +810,7 @@ def parse_alarm_datetime(dt_str):
     """ Parses ISO datetime string """
     try:
         return datetime.fromisoformat(dt_str)
-    except:
+    except (ValueError, TypeError):
         return None
 
 def next_repeat_datetime(alarm, now=None):
@@ -1562,14 +1572,15 @@ class AlarmApp(ctk.CTk):
         if self._shutting_down:
             return
         PROFILER.mark("first_idle_callback")
+        # Start alarm checker immediately so alarm reliability never depends on UI rendering
+        self._start_alarm_checker()
+        PROFILER.mark("alarm_checker_initialized")
         self._refresh_alarm_list(batch_size=25)
         self.after_idle(self._deferred_startup)
 
     def _deferred_startup(self):
         if self._shutting_down:
             return
-        self._start_alarm_checker()
-        PROFILER.mark("alarm_checker_initialized")
         self._setup_tray()
         self.after_idle(self._initialize_session_notifications)
         threading.Thread(
@@ -1848,6 +1859,7 @@ class AlarmApp(ctk.CTk):
             target=run_tray, name="TimePulseTray", daemon=False
         )
         self._tray_thread.start()
+        self.after(50, self._poll_tray_events)
         return False
 
     def _poll_tray_events(self):
@@ -1876,13 +1888,26 @@ class AlarmApp(ctk.CTk):
         except queue.Empty:
             pass
         if self._tray_starting:
-            self.after(50, self._poll_tray_events)
+            if self._tray_thread and not self._tray_thread.is_alive():
+                self._tray_starting = False
+                self._tray_failed = True
+                self._tray_ready = False
+                if self._hide_requested:
+                    self._hide_requested = False
+                    self.deiconify()
+                    self.lift()
+            else:
+                self.after(50, self._poll_tray_events)
 
     def _withdraw_window(self):
         if hasattr(self, 'audio_manager'):
             self.audio_manager.stop_preview()
+        if self._tray_ready:
+            self._hide_requested = True
+            self.withdraw()
+            return
         self._hide_requested = True
-        if not self._tray_ready and not self._setup_tray():
+        if not self._setup_tray() and not self._tray_starting:
             self._hide_requested = False
             self.deiconify()
             self.lift()
@@ -1905,7 +1930,7 @@ class AlarmApp(ctk.CTk):
         try:
             self.after(0, self._quit_app_main_thread)
         except Exception:
-            self._quit_app_main_thread()
+            self._stop_tray_for_shutdown()
 
     def _quit_app_main_thread(self):
         if self._shutting_down:
@@ -1934,7 +1959,11 @@ class AlarmApp(ctk.CTk):
         if self._shutting_down:
             return
         self._shutting_down = True
-        for timer_id in (self._alarm_check_after_id, self._clock_after_id):
+        for timer_id in (
+            self._alarm_check_after_id,
+            self._clock_after_id,
+            getattr(self, "_render_cards_after_id", None),
+        ):
             if timer_id:
                 try:
                     self.after_cancel(timer_id)
@@ -1942,6 +1971,7 @@ class AlarmApp(ctk.CTk):
                     print(f"Failed to cancel scheduled callback: {exc}")
         self._alarm_check_after_id = None
         self._clock_after_id = None
+        self._render_cards_after_id = None
         if hasattr(self, 'audio_manager'):
             self.audio_manager.stop_all()
 
@@ -2025,15 +2055,19 @@ class AlarmApp(ctk.CTk):
             self.next_alarm_lbl.configure(text=time_str)
 
             # Update Tray Tooltip
-            try:
-                tray_msg = f"TimePulse: Next alarm in {int(min_diff // 60)} minutes"
-                self.tray.title = tray_msg
-            except:
-                pass
+            if self.tray and self._tray_ready:
+                try:
+                    tray_msg = f"TimePulse: Next alarm in {int(min_diff // 60)} minutes"
+                    self.tray.title = tray_msg
+                except Exception:
+                    pass
         else:
             self.next_alarm_lbl.configure(text="No upcoming alarms")
-            try: self.tray.title = "TimePulse: No alarms"
-            except: pass
+            if self.tray and self._tray_ready:
+                try:
+                    self.tray.title = "TimePulse: No alarms"
+                except Exception:
+                    pass
     def _build_tabs(self):
         bar = ctk.CTkFrame(self, fg_color=CARD, corner_radius=10, height=42)
         bar.pack(fill="x", padx=16, pady=(8, 0)); bar.pack_propagate(False)
@@ -2464,14 +2498,17 @@ class AlarmApp(ctk.CTk):
     def _render_alarm_cards(self, alarms, generation, batch_size=None, start=0):
         if self._shutting_down or generation != self._alarm_render_generation:
             return
+        if not self.winfo_exists() or not self.alarm_scroll.winfo_exists():
+            return
         end = len(alarms) if not batch_size else min(start + batch_size, len(alarms))
         for alarm in alarms[start:end]:
             self._alarm_card(self.alarm_scroll, alarm)
         if end < len(alarms):
-            self.after(1, lambda: self._render_alarm_cards(
+            self._render_cards_after_id = self.after(1, lambda: self._render_alarm_cards(
                 alarms, generation, batch_size, end
             ))
             return
+        self._render_cards_after_id = None
         PROFILER.mark("alarm_cards_rendered")
 
     def _alarm_card(self, parent, alarm):
@@ -2901,6 +2938,8 @@ class AlarmApp(ctk.CTk):
             )
 
     def _refresh_password_controls(self):
+        if not hasattr(self, "password_help_lbl"):
+            return
         password_enabled = self.data.get("password") is not None
         if password_enabled:
             self.password_help_lbl.configure(
@@ -2955,8 +2994,9 @@ class AlarmApp(ctk.CTk):
             return
 
         was_enabled = current_hash is not None
-        self.data["password"] = hash_password(new)
-        save_data(self.data)
+        with self.data_lock:
+            self.data["password"] = hash_password(new)
+            save_data(self.data)
         for e in (self.old_pw, self.new_pw, self.confirm_pw): e.delete(0, "end")
         self._refresh_password_controls()
         success_message = (
@@ -2990,8 +3030,9 @@ class AlarmApp(ctk.CTk):
             return
 
         if messagebox.askyesno("Confirm", "Are you sure you want to disable password protection?"):
-            self.data["password"] = None
-            save_data(self.data)
+            with self.data_lock:
+                self.data["password"] = None
+                save_data(self.data)
             for e in (self.old_pw, self.new_pw, self.confirm_pw): e.delete(0, "end")
             self._refresh_password_controls()
             messagebox.showinfo("Success", "Password protection disabled.")
@@ -3522,6 +3563,10 @@ if __name__ == "__main__":
         app.mainloop()
     finally:
         if app:
+            try:
+                app._stop_tray_for_shutdown()
+            except Exception:
+                pass
             release_single_instance_mutex(app._instance_mutex_handle)
             app._instance_mutex_handle = None
         else:

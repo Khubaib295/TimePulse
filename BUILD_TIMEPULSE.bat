@@ -2,13 +2,18 @@
 setlocal
 cd /d "%~dp0"
 
-if not exist ".venv\Scripts\python.exe" (
-    echo Development environment not found. Run setup_development.bat first.
-    pause
-    exit /b 1
+set "PYTHON_EXE=.venv\Scripts\python.exe"
+if not exist "%PYTHON_EXE%" (
+    where python >nul 2>&1
+    if errorlevel 1 (
+        echo Development environment not found. Run setup_development.bat or install Python.
+        pause
+        exit /b 1
+    )
+    set "PYTHON_EXE=python"
 )
 
-".venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm TimePulse.spec
+"%PYTHON_EXE%" -m PyInstaller --clean --noconfirm TimePulse.spec
 if errorlevel 1 (
     echo.
     echo Build failed.
