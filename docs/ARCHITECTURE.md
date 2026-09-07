@@ -49,13 +49,16 @@ Password protection is optional. New passwords are stored as salted PBKDF2-HMAC-
 
 ### Packaging
 
-`TimePulse.spec` builds a one-file, windowed `TimePulse.exe`. It bundles:
+`TimePulse.spec` builds a windowed PyInstaller **onedir** distribution at
+`dist\TimePulse\TimePulse.exe`. It bundles:
 
 - CustomTkinter package assets.
 - `assets/TimePulse.ico`.
-- The complete `ringtones/` directory.
+- CustomTkinter and the icon within the application directory.
 
-External WAV files placed in a `ringtones` directory beside the executable take priority over bundled files.
+The build script copies the complete `ringtones/` directory beside the
+executable. External WAV files there take priority, and the audio files are not
+embedded in an archive that must be extracted on every application launch.
 
 
 ## Reliability boundaries

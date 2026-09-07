@@ -356,13 +356,25 @@ Build the Windows executable:
 python -m PyInstaller --clean TimePulse.spec
 ```
 
-The packaged executable is generated as:
+The startup-optimized package is generated as:
 
 ```text
-dist\TimePulse.exe
+dist\TimePulse\TimePulse.exe
 ```
 
-The PyInstaller specification bundles the required application resources, icon, and ringtones.
+This is a PyInstaller **onedir** build: launch `TimePulse.exe` from its folder,
+and distribute the whole `dist\TimePulse` directory through an installer if a
+single download is desired. Do not convert it back to onefile—the onefile
+bootloader extracts the full application into `%TEMP%` every launch. The build
+script copies `ringtones\` alongside the executable so the 67 MB audio set is
+never extracted at startup.
+
+To collect five comparable source or packaged-startup samples:
+
+```cmd
+python benchmark_startup.py --source --runs 5
+python benchmark_startup.py --exe dist\TimePulse\TimePulse.exe --runs 5
+```
 
 Generated build artifacts are intentionally excluded from the Git repository:
 

@@ -38,8 +38,9 @@ The test suite verifies logic that does not require an interactive Windows deskt
 14. Verify light and dark appearance modes.
 15. Minimize to the tray, restore the window, and exit from the tray menu.
 16. Confirm the Startup entry launches TimePulse at the next sign-in.
-17. Build with `pyinstaller --clean TimePulse.spec`.
-18. Run `dist\TimePulse.exe` and repeat the alarm and ringtone checks.
+17. Build with `pyinstaller --clean --noconfirm TimePulse.spec`.
+18. Copy `ringtones\` to `dist\TimePulse\ringtones\` (or use `BUILD_TIMEPULSE.bat`).
+19. Run `dist\TimePulse\TimePulse.exe` and repeat the alarm and ringtone checks.
 19. Exit and verify no TimePulse or orphan audio process remains.
 
 The Linux-based preparation environment cannot truthfully validate Windows audio, locking, tray behavior, startup, or the final executable. Those checks must be completed on Windows.

@@ -1,15 +1,62 @@
+import os
+import sys
+import time
+import threading
+
+_STARTUP_T0 = time.perf_counter()
+
+class _StartupProfiler:
+    def __init__(self):
+        self.enabled = (
+            os.environ.get("TIMEPULSE_PROFILE_STARTUP") == "1"
+            or os.environ.get("TIMEPULSE_PROFILE") == "1"
+            or "--profile-startup" in sys.argv
+            or "--profile" in sys.argv
+        )
+        self.t0 = _STARTUP_T0
+        self.milestones = [("process_entry", 0.0)]
+        self._lock = threading.Lock() if "threading" in sys.modules else None
+
+    def mark(self, name):
+        if self.enabled:
+            elapsed_ms = (time.perf_counter() - self.t0) * 1000.0
+            if self._lock:
+                with self._lock:
+                    self.milestones.append((name, elapsed_ms))
+            else:
+                self.milestones.append((name, elapsed_ms))
+
+    def dump(self):
+        if self.enabled:
+            lines = ["", "=" * 55, "  TIMEPULSE STARTUP PERFORMANCE AUDIT PROFILE", "=" * 55]
+            prev = 0.0
+            milestones = list(self.milestones)
+            for name, elapsed in milestones:
+                delta = elapsed - prev
+                lines.append(f"  {name:<32} : {elapsed:7.2f} ms (+{delta:6.2f} ms)")
+                prev = elapsed
+            lines.extend(["=" * 55, ""])
+            report = "\n".join(lines)
+            print(report, flush=True)
+            report_path = os.environ.get("TIMEPULSE_PROFILE_STARTUP_FILE")
+            if report_path:
+                try:
+                    with open(report_path, "w", encoding="utf-8", newline="\n") as report_file:
+                        report_file.write(report)
+                except OSError as exc:
+                    print(f"Failed to write startup profile: {exc}", flush=True)
+
+PROFILER = _StartupProfiler()
+
 import customtkinter as ctk
 import calendar
 import json
-import os
 import hashlib
 import hmac
 import shutil
-import threading
-import time
+import queue
 import subprocess
 import uuid
-import sys
 import tempfile
 import ctypes
 import atexit
@@ -28,13 +75,11 @@ ERROR_ALREADY_EXISTS = 183
 # Preserve the legacy-compatible identifier so KRONOS and TimePulse cannot run together.
 MUTEX_NAME_PREFIX = "Local\\KRONOS_Alarm_"
 
-from xml.sax.saxutils import escape
 from pathlib import Path
 from datetime import datetime, timedelta, date
 from tkinter import messagebox
 
-import pystray
-from PIL import Image, ImageTk
+PROFILER.mark("imports_complete")
 
 # ---------------- Helpers ----------------
 def resource_path(relative_path):
@@ -151,8 +196,6 @@ else:
 
 DATA_FILE  = os.path.join(DATA_DIR, "alarms.json")
 HISTORY_DIR = os.path.join(DATA_DIR, "Alarm History")
-if not os.path.exists(HISTORY_DIR):
-    os.makedirs(HISTORY_DIR)
 HISTORY_FILE = os.path.join(HISTORY_DIR, "alarm_history.txt")
 DEFAULT_HASH = None # None means password protection is disabled
 DEFAULT_ALLOW_SNOOZE = True
@@ -215,11 +258,11 @@ def apply_window_icon(window):
             return
 
         errors = []
+        native_icon_applied = False
 
         # Native Windows caption icon: this is the reliable path for CTkToplevel.
         if os.name == "nt":
             try:
-                window.update_idletasks()
                 hwnd = int(window.winfo_id())
 
                 user32 = ctypes.windll.user32
@@ -273,29 +316,32 @@ def apply_window_icon(window):
                 # Keep references on the window as well.
                 window._native_small_icon = small_icon
                 window._native_big_icon = big_icon
+                native_icon_applied = True
             except Exception as exc:
                 errors.append(f"WM_SETICON failed: {exc}")
 
-        # Tk fallback, also useful for taskbar/window manager integration.
-        try:
-            cache_key = os.path.abspath(ICON_PATH)
-            photo = _icon_photo_cache.get(cache_key)
+        # Loading Pillow and decoding an icon is unnecessary on Windows when
+        # WM_SETICON succeeded. Keep that import off the first-paint path.
+        if not native_icon_applied:
+            try:
+                from PIL import Image, ImageTk
 
-            if photo is None:
-                with Image.open(ICON_PATH) as icon_image:
-                    icon_image = icon_image.convert("RGBA")
-                    photo = ImageTk.PhotoImage(icon_image)
-                _icon_photo_cache[cache_key] = photo
+                cache_key = os.path.abspath(ICON_PATH)
+                photo = _icon_photo_cache.get(cache_key)
+                if photo is None:
+                    with Image.open(ICON_PATH) as icon_image:
+                        icon_image = icon_image.convert("RGBA")
+                        photo = ImageTk.PhotoImage(icon_image)
+                    _icon_photo_cache[cache_key] = photo
+                window._app_icon_photo = photo
+                window.iconphoto(False, photo)
+            except Exception as exc:
+                errors.append(f"iconphoto failed: {exc}")
 
-            window._app_icon_photo = photo
-            window.iconphoto(False, photo)
-        except Exception as exc:
-            errors.append(f"iconphoto failed: {exc}")
-
-        try:
-            window.iconbitmap(default=ICON_PATH)
-        except Exception as exc:
-            errors.append(f"iconbitmap failed: {exc}")
+            try:
+                window.iconbitmap(default=ICON_PATH)
+            except Exception as exc:
+                errors.append(f"iconbitmap failed: {exc}")
 
         if len(errors) == 3 and not _icon_warning_shown:
             print("Failed to apply assets/TimePulse.ico: " + " | ".join(errors))
@@ -305,8 +351,9 @@ def apply_window_icon(window):
     # important for CustomTkinter Toplevel windows.
     try:
         _apply()
+        # A single idle retry covers windows that are not realized yet without
+        # forcing an update or doing redundant image decoding during startup.
         window.after_idle(_apply)
-        window.after(200, _apply)
     except Exception:
         _apply()
 
@@ -317,6 +364,7 @@ def log_history_event(alarm, event):
     log_entry = f"{timestamp} - {label} ({event})\n"
 
     try:
+        os.makedirs(HISTORY_DIR, exist_ok=True)
         with open(HISTORY_FILE, "a") as f:
             f.write(log_entry)
     except Exception as e:
@@ -468,6 +516,7 @@ def requires_alarm_change_auth(protect_edit_delete):
 STARTUP_FILE_NAME = "TimePulse Startup.cmd"
 LEGACY_STARTUP_FILE_NAMES = ("Alarm App Startup.cmd",)
 LEGACY_TASK_NAMES = ("AlarmApp_AutoStart", "AlarmApp_AutoStart_Login")
+STARTUP_MIGRATION_VERSION = 1
 
 def get_app_launch_details():
     """Return the executable and arguments used by the Windows Startup entry."""
@@ -577,9 +626,6 @@ def enable_auto_start():
 
 def ensure_login_auto_start():
     """Ensure the app starts automatically at Windows sign-in."""
-    _remove_legacy_startup_files()
-    _remove_legacy_scheduled_tasks()
-
     startup_file = get_startup_file_path()
     if not startup_file:
         return False
@@ -600,6 +646,39 @@ def ensure_login_auto_start():
             pass
 
     return enable_auto_start()
+
+
+def run_startup_migration(data, data_lock):
+    """Run legacy Startup/Task Scheduler cleanup once and record completion.
+
+    This deliberately accepts the in-memory settings dictionary so its marker
+    remains backward-compatible with existing alarms.json files (unknown keys
+    are already preserved by the normalizer). Call it from a worker thread.
+    """
+    try:
+        with data_lock:
+            current_version = int(data.get("startup_migration_version", 0) or 0)
+        if current_version >= STARTUP_MIGRATION_VERSION:
+            return False
+    except (TypeError, ValueError):
+        current_version = 0
+
+    _remove_legacy_startup_files()
+    _remove_legacy_scheduled_tasks()
+
+    with data_lock:
+        try:
+            current_version = int(data.get("startup_migration_version", 0) or 0)
+        except (TypeError, ValueError):
+            current_version = 0
+        if current_version >= STARTUP_MIGRATION_VERSION:
+            return False
+        data["startup_migration_version"] = STARTUP_MIGRATION_VERSION
+        if save_data(data):
+            return True
+        data.pop("startup_migration_version", None)
+        print("Startup migration will be retried because its completion marker could not be saved.")
+        return False
 
 
 def disable_auto_start():
@@ -1412,6 +1491,11 @@ class DatePickerField(ctk.CTkFrame):
 
 class AlarmApp(ctk.CTk):
     def __init__(self):
+        PROFILER.mark("app_construction_begin")
+        # Reading the small settings file is essential, but creating a Tk
+        # window first makes that work part of the perceived first paint.
+        initial_data = load_data()
+        PROFILER.mark("config_data_load_complete")
         super().__init__()
         self.title("TimePulse")
         width, height = 430, 650
@@ -1424,8 +1508,9 @@ class AlarmApp(ctk.CTk):
         
         # Set window icon
         apply_window_icon(self)
+        PROFILER.mark("root_window_created")
 
-        self.data = load_data()
+        self.data = initial_data
         self.data_lock = threading.Lock()
         self.audio_manager = AudioManager(self)
         self.hwnd = None
@@ -1442,8 +1527,12 @@ class AlarmApp(ctk.CTk):
         self._tray_starting = False
         self._tray_ready_event = threading.Event()
         self._tray_failed = False
+        self._tray_events = queue.Queue()
         self._hide_requested = False
         self.tab_frames = {}
+        self._ringtone_path_cache = {}
+        self._alarm_render_generation = 0
+        self._render_cards_after_id = None
         self.auto_sync_active = True # New: Auto-sync alarm setter with clock
         self.active_alarm_ids = set() # Track alarms currently firing
         self._alarm_check_running = False # Avoid duplicate scheduled loops
@@ -1451,29 +1540,71 @@ class AlarmApp(ctk.CTk):
         self.history_popup = None
         self.hist_container = None
         
-        # System Tray & Background Logic (Deferred for faster startup)
+        # Expensive integrations start only after the visible shell gets an
+        # idle turn. They never gate the first window paint.
         self.protocol("WM_DELETE_WINDOW", self._withdraw_window)
-        self.after(100, self._deferred_startup)
-        
+
         self._build_header()
+        PROFILER.mark("header_created")
         self._build_clock()
+        PROFILER.mark("clock_created")
         self._build_tabs()
+        PROFILER.mark("tab_navigation_created")
         self._build_alarm_tab()
-        self._build_timer_tab()
-        self._build_settings_tab()
-        self._show_tab("alarms")
+        PROFILER.mark("alarms_shell_created")
+        self._show_tab("alarms", refresh_alarms=False)
         self._start_clock()
+        PROFILER.mark("app_construction_complete")
+        self.after_idle(self._on_first_idle)
+
+    def _on_first_idle(self):
+        """Let Tk draw the shell before populating potentially long card lists."""
+        if self._shutting_down:
+            return
+        PROFILER.mark("first_idle_callback")
+        self._refresh_alarm_list(batch_size=25)
+        self.after_idle(self._deferred_startup)
 
     def _deferred_startup(self):
-        self._setup_tray()
-        self._setup_session_notifications()
+        if self._shutting_down:
+            return
         self._start_alarm_checker()
+        PROFILER.mark("alarm_checker_initialized")
+        self._setup_tray()
+        self.after_idle(self._initialize_session_notifications)
+        threading.Thread(
+            target=self._run_background_startup,
+            name="TimePulseStartup",
+            daemon=True,
+        ).start()
+        PROFILER.mark("deferred_startup_dispatched")
+        self.after(500, self._finish_startup_profile)
 
+    def _initialize_session_notifications(self):
+        if self._shutting_down:
+            return
+        self._setup_session_notifications()
+        PROFILER.mark("session_notifications_initialized")
+
+    def _run_background_startup(self):
+        """Perform Windows-file and Task Scheduler work outside Tk's thread."""
+        PROFILER.mark("auto_start_migration_initialized")
         if not ensure_login_auto_start():
             print(
                 "Automatic login startup could not be enabled. "
                 "The app will continue running normally."
             )
+        run_startup_migration(self.data, self.data_lock)
+        PROFILER.mark("auto_start_migration_complete")
+        PROFILER.mark("deferred_startup_complete")
+
+    def _finish_startup_profile(self):
+        if not PROFILER.enabled or self._shutting_down:
+            return
+        if self._tray_starting and (time.perf_counter() - _STARTUP_T0) < 5:
+            self.after(100, self._finish_startup_profile)
+            return
+        PROFILER.dump()
 
     def get_ringtones_dir(self):
         dirs = self.get_ringtone_dirs()
@@ -1531,6 +1662,10 @@ class AlarmApp(ctk.CTk):
         if not valid_name:
             return None
 
+        cache = getattr(self, "_ringtone_path_cache", None)
+        if cache is not None and valid_name in cache:
+            return cache[valid_name]
+
         for ringtones_dir in self.get_ringtone_dirs():
             try:
                 resolved_dir = os.path.realpath(ringtones_dir)
@@ -1538,9 +1673,13 @@ class AlarmApp(ctk.CTk):
                 if os.path.commonpath([resolved_dir, resolved_file]) != resolved_dir:
                     continue
                 if os.path.isfile(resolved_file):
+                    if cache is not None:
+                        cache[valid_name] = resolved_file
                     return resolved_file
             except Exception as exc:
                 print(f"Error resolving ringtone '{valid_name}': {exc}")
+        if cache is not None:
+            cache[valid_name] = None
         return None
 
     def _setup_session_notifications(self):
@@ -1665,69 +1804,88 @@ class AlarmApp(ctk.CTk):
         if self._shutting_down or self._tray_ready:
             return self._tray_ready
         if self._tray_starting:
-            return self._tray_ready_event.wait(1)
+            return False
         if not ICON_PATH:
             print("System tray icon disabled because no icon file was found.")
             return False
 
-        try:
-            self._tray_starting = True
-            self._tray_ready_event.clear()
-            self._tray_failed = False
-            image = Image.open(ICON_PATH)
-            menu = pystray.Menu(
-                pystray.MenuItem("Show", self._show_window, default=True),
-                pystray.MenuItem("Exit", self._quit_app)
-            )
-            self.tray = pystray.Icon("TimePulse", image, "TimePulse Alarm", menu)
-            self._tray_image = image
+        # pystray and Pillow are intentionally imported inside the worker. A
+        # slow tray backend must never freeze CustomTkinter's event loop.
+        PROFILER.mark("tray_initialization_start")
+        self._tray_starting = True
+        self._tray_failed = False
+        self._tray_ready_event.clear()
 
-            tray = self.tray
+        def run_tray():
+            tray = None
+            image = None
+            try:
+                import pystray
+                from PIL import Image
 
-            def tray_setup(icon):
-                if self._shutting_down:
-                    icon.stop()
-                    return
-                icon.visible = True
-                self._tray_ready_event.set()
+                image = Image.open(ICON_PATH)
+                menu = pystray.Menu(
+                    pystray.MenuItem("Show", self._show_window, default=True),
+                    pystray.MenuItem("Exit", self._quit_app),
+                )
+                tray = pystray.Icon("TimePulse", image, "TimePulse Alarm", menu)
 
-            def run_tray():
-                try:
-                    tray.run(setup=tray_setup)
-                except Exception as exc:
-                    self._tray_failed = True
+                def tray_setup(icon):
+                    if self._shutting_down:
+                        icon.stop()
+                        return
+                    icon.visible = True
                     self._tray_ready_event.set()
-                    print(f"Tray error: {exc}")
+                    self._tray_events.put(("ready", tray, image))
 
-            self._tray_thread = threading.Thread(target=run_tray, daemon=False)
-            self._tray_thread.start()
-            if self._tray_ready_event.wait(1) and not self._tray_failed:
-                self._tray_ready = True
-                return True
+                tray.run(setup=tray_setup)
+            except Exception as exc:
+                self._tray_ready_event.set()
+                self._tray_events.put(("failed", None, None))
+                print(f"Tray error: {exc}")
 
-            if self.tray:
-                self.tray.stop()
-            self.tray = None
-            return False
-        except Exception as e:
-            self.tray = None
-            print(f"Tray error: {e}")
-            return False
-        finally:
-            self._tray_starting = False
+        self._tray_thread = threading.Thread(
+            target=run_tray, name="TimePulseTray", daemon=False
+        )
+        self._tray_thread.start()
+        return False
+
+    def _poll_tray_events(self):
+        """Apply worker results on Tk's thread without waiting for the tray."""
+        if self._shutting_down:
+            return
+        try:
+            while True:
+                status, tray, image = self._tray_events.get_nowait()
+                self._tray_starting = False
+                if status == "ready":
+                    self.tray = tray
+                    self._tray_image = image
+                    self._tray_ready = True
+                    PROFILER.mark("tray_initialization_complete")
+                    if self._hide_requested:
+                        self.withdraw()
+                else:
+                    self._tray_failed = True
+                    self.tray = None
+                    self._tray_ready = False
+                    if self._hide_requested:
+                        self._hide_requested = False
+                        self.deiconify()
+                        self.lift()
+        except queue.Empty:
+            pass
+        if self._tray_starting:
+            self.after(50, self._poll_tray_events)
 
     def _withdraw_window(self):
         if hasattr(self, 'audio_manager'):
             self.audio_manager.stop_preview()
         self._hide_requested = True
         if not self._tray_ready and not self._setup_tray():
-            # Do not leave the application inaccessible when the tray cannot
-            # be created (for example, a missing packaged icon).
             self._hide_requested = False
             self.deiconify()
             self.lift()
-            return
-        self.withdraw()
 
     def _show_window(self):
         def restore_window():
@@ -1891,7 +2049,14 @@ class AlarmApp(ctk.CTk):
             b.grid(row=0, column=i, sticky="ew", padx=4, pady=4)
             self.tab_btns[key] = b
 
-    def _show_tab(self, key):
+    def _show_tab(self, key, refresh_alarms=True):
+        if key == "timers" and key not in self.tab_frames:
+            self._build_timer_tab()
+            PROFILER.mark("timers_tab_created")
+        elif key == "settings" and key not in self.tab_frames:
+            self._build_settings_tab()
+            PROFILER.mark("settings_tab_created")
+
         for k, f in self.tab_frames.items():
             if k == key:
                 f.pack(fill="both", expand=True, padx=16, pady=8)
@@ -1899,7 +2064,7 @@ class AlarmApp(ctk.CTk):
             else:
                 f.pack_forget()
                 self.tab_btns[k].configure(fg_color="transparent", text_color=SUBTEXT)
-        if key == "alarms":
+        if key == "alarms" and refresh_alarms:
             self._refresh_alarm_list()
         elif key == "settings":
             self._refresh_password_controls()
@@ -2272,7 +2437,14 @@ class AlarmApp(ctk.CTk):
         messagebox.showinfo("Timer Set", f"Alarm set for {target.strftime('%Y-%m-%d %I:%M %p')}")
         self._refresh_alarm_list()
 
-    def _refresh_alarm_list(self):
+    def _refresh_alarm_list(self, batch_size=None):
+        """Render cards separately from alarm scheduling/checking.
+
+        ``batch_size`` is only used at initial startup. It lets a large saved
+        alarm list remain responsive while the checker is already active.
+        """
+        self._alarm_render_generation += 1
+        generation = self._alarm_render_generation
         for w in self.alarm_scroll.winfo_children():
             w.destroy()
         with self.data_lock:
@@ -2284,9 +2456,23 @@ class AlarmApp(ctk.CTk):
             ctk.CTkLabel(empty_f, text="No alarms", font=("Segoe UI Black", 24, "bold"), text_color=TEXT).pack()
             ctk.CTkLabel(empty_f, text="No alarms set yet.\nStart by creating one above!",
                          font=("Segoe UI", 14), text_color=SUBTEXT, justify="center").pack(pady=10)
+            PROFILER.mark("alarm_cards_rendered")
             return
-        for alarm in alarms:
+
+        self._render_alarm_cards(alarms, generation, batch_size)
+
+    def _render_alarm_cards(self, alarms, generation, batch_size=None, start=0):
+        if self._shutting_down or generation != self._alarm_render_generation:
+            return
+        end = len(alarms) if not batch_size else min(start + batch_size, len(alarms))
+        for alarm in alarms[start:end]:
             self._alarm_card(self.alarm_scroll, alarm)
+        if end < len(alarms):
+            self.after(1, lambda: self._render_alarm_cards(
+                alarms, generation, batch_size, end
+            ))
+            return
+        PROFILER.mark("alarm_cards_rendered")
 
     def _alarm_card(self, parent, alarm):
         enabled = alarm.get("enabled", True)
@@ -3332,6 +3518,7 @@ if __name__ == "__main__":
     try:
         app = AlarmApp()
         app._instance_mutex_handle = instance_mutex_handle
+        PROFILER.mark("mainloop_reached")
         app.mainloop()
     finally:
         if app:

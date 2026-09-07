@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-".venv\Scripts\python.exe" -m PyInstaller --clean TimePulse.spec
+".venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm TimePulse.spec
 if errorlevel 1 (
     echo.
     echo Build failed.
@@ -16,6 +16,15 @@ if errorlevel 1 (
     exit /b 1
 )
 
+xcopy /E /I /Y "ringtones" "dist\TimePulse\ringtones" >nul
+if errorlevel 1 (
+    echo.
+    echo Failed to copy external ringtone resources.
+    pause
+    exit /b 1
+)
+
 echo.
-echo Build completed: dist\TimePulse.exe
+echo Build completed: dist\TimePulse\TimePulse.exe
+echo Package the complete dist\TimePulse folder in an installer; do not use onefile.
 pause
